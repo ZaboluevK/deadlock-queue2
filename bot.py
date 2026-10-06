@@ -35,17 +35,33 @@ def queue_users(guild_id):
 
 def panel_embed(guild_id):
     users = queue_users(guild_id)
+    party, waiting = users[:PARTY_SIZE], users[PARTY_SIZE:]
     embed = discord.Embed(title="🎮 Очередь в Deadlock", color=0xE8A33D)
-    if users:
-        lines = [f"{i}. <@{u}>" for i, u in enumerate(users, 1)]
-        embed.description = "\n".join(lines)
-    else:
-        embed.description = "*Пока никого. Жми «Записаться»!*"
-    embed.set_footer(text=f"В очереди: {len(users)}/{PARTY_SIZE}")
+    slots = [f"{i}. <@{party[i - 1]}>" if i <= len(party) else f"{i}. *свободно*"
+             for i in range(1, PARTY_SIZE + 1)]
+    embed.add_field(name=f"Пачка ({len(party)}/{PARTY_SIZE})",
+                    value="\n".join(slots), inline=False)
+    embed.add_field(
+        name=f"Очередь ({len(waiting)})",
+        value="\n".join(f"{i}. <@{u}>" for i, u in enumerate(waiting, 1)) or "*пусто*",
+        inline=False)
     return embed
 
 
-async def refresh_panel(client, guild_id):
+def party_notice(before, after):
+    """Текст пинга, если после изменения в пачке появились новые люди."""
+    party_before, party_after = before[:PARTY_SIZE], after[:PARTY_SIZE]
+    new = [u for u in party_after if u not in party_before]
+    if len(party_after) < PARTY_SIZE or not new:
+        return None
+    if len(party_before) < PARTY_SIZE:
+        mentions = " ".join(f"<@{u}>" for u in party_after)
+        return f"🔥 Пачка собрана! {mentions} — го в Deadlock!"
+    mentions = " ".join(f"<@{u}>" for u in new)
+    return f"🔔 {mentions} — освободилось место, ты в пачке!"
+
+
+async def refresh_panel(client, guild_id, notice=None):
     row = db.execute(
         "SELECT channel_id, message_id FROM panels WHERE guild_id=?", (guild_id,)
     ).fetchone()
@@ -55,6 +71,10 @@ async def refresh_panel(client, guild_id):
         channel = client.get_channel(row[0]) or await client.fetch_channel(row[0])
         msg = await channel.fetch_message(row[1])
         await msg.edit(embed=panel_embed(guild_id), view=QueueView())
+        if notice:
+            await channel.send(notice)
+    except discord.Forbidden:
+        pass
     except discord.NotFound:
         db.execute("DELETE FROM panels WHERE guild_id=?", (guild_id,))
         db.commit()
@@ -64,46 +84,58 @@ class QueueView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def _update(self, interaction, before):
+        gid = interaction.guild_id
+        await interaction.response.edit_message(embed=panel_embed(gid), view=self)
+        notice = party_notice(before, queue_users(gid))
+        if notice:
+            await interaction.followup.send(notice)
+
     @discord.ui.button(label="Записаться", style=discord.ButtonStyle.success,
                        emoji="✅", custom_id="queue:join")
     async def join(self, interaction: discord.Interaction, _):
-        gid, uid = interaction.guild_id, interaction.user.id
+        gid = interaction.guild_id
+        before = queue_users(gid)
         cur = db.execute(
-            "INSERT OR IGNORE INTO queue VALUES(?,?,?)", (gid, uid, time.time())
-        )
+            "INSERT OR IGNORE INTO queue VALUES(?,?,?)",
+            (gid, interaction.user.id, time.time()))
         db.commit()
         if cur.rowcount == 0:
-            await interaction.response.send_message("Ты уже в очереди.", ephemeral=True)
+            await interaction.response.send_message("Ты уже в списке.", ephemeral=True)
             return
-
-        users = queue_users(gid)
-        if len(users) >= PARTY_SIZE:
-            party = users[:PARTY_SIZE]
-            db.executemany("DELETE FROM queue WHERE guild_id=? AND user_id=?",
-                           [(gid, u) for u in party])
-            for u in party:
-                db.execute(
-                    "INSERT INTO stats(guild_id,user_id,games) VALUES(?,?,1) "
-                    "ON CONFLICT(guild_id,user_id) DO UPDATE SET games=games+1",
-                    (gid, u))
-            db.commit()
-            mentions = " ".join(f"<@{u}>" for u in party)
-            await interaction.response.edit_message(embed=panel_embed(gid), view=self)
-            await interaction.channel.send(f"🔥 Пачка собрана! {mentions} — го в Deadlock!")
-        else:
-            await interaction.response.edit_message(embed=panel_embed(gid), view=self)
+        await self._update(interaction, before)
 
     @discord.ui.button(label="Выйти", style=discord.ButtonStyle.danger,
                        emoji="🚪", custom_id="queue:leave")
     async def leave(self, interaction: discord.Interaction, _):
         gid = interaction.guild_id
+        before = queue_users(gid)
         cur = db.execute("DELETE FROM queue WHERE guild_id=? AND user_id=?",
                          (gid, interaction.user.id))
         db.commit()
         if cur.rowcount == 0:
-            await interaction.response.send_message("Тебя нет в очереди.", ephemeral=True)
+            await interaction.response.send_message("Тебя нет в списке.", ephemeral=True)
             return
-        await interaction.response.edit_message(embed=panel_embed(gid), view=self)
+        await self._update(interaction, before)
+
+    @discord.ui.button(label="Закончили игру", style=discord.ButtonStyle.primary,
+                       emoji="🏁", custom_id="queue:finish")
+    async def finish(self, interaction: discord.Interaction, _):
+        gid = interaction.guild_id
+        before = queue_users(gid)
+        party = before[:PARTY_SIZE]
+        if interaction.user.id not in party:
+            await interaction.response.send_message(
+                "Завершить игру может только тот, кто в пачке.", ephemeral=True)
+            return
+        db.executemany("DELETE FROM queue WHERE guild_id=? AND user_id=?",
+                       [(gid, u) for u in party])
+        db.executemany(
+            "INSERT INTO stats(guild_id,user_id,games) VALUES(?,?,1) "
+            "ON CONFLICT(guild_id,user_id) DO UPDATE SET games=games+1",
+            [(gid, u) for u in party])
+        db.commit()
+        await self._update(interaction, [])
 
 
 class Bot(discord.Client):
@@ -121,12 +153,11 @@ class Bot(discord.Client):
         cutoff = time.time() - TIMEOUT_SEC
         guilds = [r[0] for r in db.execute(
             "SELECT DISTINCT guild_id FROM queue WHERE joined_at<?", (cutoff,))]
-        if not guilds:
-            return
-        db.execute("DELETE FROM queue WHERE joined_at<?", (cutoff,))
-        db.commit()
         for gid in guilds:
-            await refresh_panel(self, gid)
+            before = queue_users(gid)
+            db.execute("DELETE FROM queue WHERE guild_id=? AND joined_at<?", (gid, cutoff))
+            db.commit()
+            await refresh_panel(self, gid, party_notice(before, queue_users(gid)))
 
 
 bot = Bot()
