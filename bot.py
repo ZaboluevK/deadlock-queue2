@@ -128,6 +128,10 @@ class QueueView(discord.ui.View):
             await interaction.response.send_message(
                 "Завершить игру может только тот, кто в пачке.", ephemeral=True)
             return
+        if len(party) < PARTY_SIZE:
+            await interaction.response.send_message(
+                f"Пачка ещё не собрана ({len(party)}/{PARTY_SIZE}).", ephemeral=True)
+            return
         db.executemany("DELETE FROM queue WHERE guild_id=? AND user_id=?",
                        [(gid, u) for u in party])
         db.executemany(
