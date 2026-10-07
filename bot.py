@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 import time
@@ -8,6 +9,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 
 load_dotenv()
+log = logging.getLogger("queue")
 TOKEN = os.environ["DISCORD_TOKEN"]
 PARTY_SIZE = int(os.getenv("PARTY_SIZE", "6"))
 TIMEOUT_SEC = float(os.getenv("QUEUE_TIMEOUT_HOURS", "3")) * 3600
@@ -67,17 +69,22 @@ async def refresh_panel(client, guild_id, notice=None):
     ).fetchone()
     if not row:
         return
+    channel = client.get_partial_messageable(row[0])
     try:
-        channel = client.get_channel(row[0]) or await client.fetch_channel(row[0])
-        msg = await channel.fetch_message(row[1])
-        await msg.edit(embed=panel_embed(guild_id), view=QueueView())
-        if notice:
-            await channel.send(notice)
-    except discord.Forbidden:
-        pass
+        # правим по id, без чтения истории канала (не нужно право Read Message History)
+        await channel.get_partial_message(row[1]).edit(
+            embed=panel_embed(guild_id), view=QueueView())
     except discord.NotFound:
         db.execute("DELETE FROM panels WHERE guild_id=?", (guild_id,))
         db.commit()
+        return
+    except discord.HTTPException as e:
+        log.warning("не удалось обновить панель (guild %s): %s", guild_id, e)
+    if notice:
+        try:
+            await channel.send(notice)
+        except discord.HTTPException as e:
+            log.warning("не удалось отправить пинг (guild %s): %s", guild_id, e)
 
 
 class QueueView(discord.ui.View):
