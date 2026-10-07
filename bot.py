@@ -189,6 +189,24 @@ async def clear(interaction: discord.Interaction):
     await refresh_panel(bot, interaction.guild_id)
 
 
+@bot.tree.command(name="kick", description="Убрать игрока из пачки или очереди")
+@app_commands.describe(user="Кого убрать")
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def kick(interaction: discord.Interaction, user: discord.Member):
+    gid = interaction.guild_id
+    before = queue_users(gid)
+    cur = db.execute("DELETE FROM queue WHERE guild_id=? AND user_id=?", (gid, user.id))
+    db.commit()
+    if cur.rowcount == 0:
+        await interaction.response.send_message(
+            f"{user.mention} нет в списке.", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"{user.mention} убран из списка.", ephemeral=True)
+    await refresh_panel(bot, gid, party_notice(before, queue_users(gid)))
+
+
 @bot.tree.command(name="stats", description="Топ игроков по числу собранных пачек")
 @app_commands.guild_only()
 async def stats(interaction: discord.Interaction):
